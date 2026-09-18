@@ -1,10 +1,8 @@
 import os
 import time
-import json
 import threading
 import requests
 from flask import Flask
-from openai import OpenAI
 
 # ==========================================
 # FLASK WEBB SERVER (FÖR GRATIS RENDER)
@@ -22,14 +20,12 @@ def run_web_server():
 # ==========================================
 # KONFIGURATION
 # ==========================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = "8652036515:AAGbRQafmDHgcCRAbF2JV75beaqF9GptdgM"
 TELEGRAM_CHAT_ID = "8405852294"
 
 CHECK_INTERVAL = 10
 MAX_AGE_MINUTES = 15.0
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 seen_tokens = set()
 
 # ==========================================
@@ -56,15 +52,18 @@ def fetch_gmgn_hot_searches():
                 
                 if age_minutes <= MAX_AGE_MINUTES:
                     is_paid = t.get("is_paid", False) or t.get("has_socials", False)
-                    is_circled = t.get("hot_level", 0) > 1 or t.get("swaps", 0) > 300
+                    swaps = t.get("swaps", 0)
+                    volume = t.get("volume", 0)
+                    liquidity = t.get("liquidity", 0)
+                    is_circled = t.get("hot_level", 0) > 1 or swaps > 300
                     
                     parsed_tokens.append({
                         "address": t.get("address"),
                         "symbol": t.get("name", "Unknown"),
                         "ticker": t.get("symbol", "MEME"),
-                        "liquidity": t.get("liquidity", 0),
-                        "volume_5m": t.get("volume", 0),
-                        "swaps_5m": t.get("swaps", 0),
+                        "liquidity": liquidity,
+                        "volume_5m": volume,
+                        "swaps_5m": swaps,
                         "age_minutes": round(age_minutes, 1),
                         "is_paid": is_paid,
                         "is_circled": is_circled,
@@ -77,49 +76,38 @@ def fetch_gmgn_hot_searches():
     return []
 
 # ==========================================
-# 2. AI ANALYS
+# 2. EVALUATE RARITY (UTAN AI)
 # ==========================================
-def analyze_coin_with_ai(token):
-    prompt = f"""
-Du är en elit memecoin-trader på Solana som letar efter nästa 100x gem på GMGN Hot Searches.
-Utvärdera följande token (Ålder: {token['age_minutes']} min):
-
-- Ticker: ${token['ticker']}
-- Namn: {token['symbol']}
-- Likviditet: ${token['liquidity']:,} - 5m Volym:${token['volume_5m']:,}
-- 5m Swaps/Köp: {token['swaps_5m']}
-- GMGN Paid/Socials: {token['is_paid']}
-- GMGN High Hype (Circled): {token['is_circled']}
-
-Bestäm om myntet har hög potential och ge det en raritet (COMMON, RARE, LEGENDARY):
-- COMMON: Bra första tryck/swaps, nyligen startad (< 15 min).
-- RARE: Stark volym/likviditet, har Paid badge/verifierat eller mycket aktiv köpvåg.
-- LEGENDARY: Galen köpvåg, Paid/Circled, perfekt viral narrative.
-
-Svara BARA i giltigt JSON:
-{{
-  "is_good": true/false,
-  "rarity": "COMMON" / "RARE" / "LEGENDARY",
-  "narrative_score": 1-10,
-  "analysis": "Kort motivering på svenska."
-}}
-"""
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        print(f"AI Error: {e}")
+def evaluate_coin(token):
+    # Minimum-krav för att skicka notis överhuvudtaget
+    if token["liquidity"] < 1500 or token["swaps_5m"] < 30:
         return None
+
+    # Bestäm raritet baserat på GMGN-data
+    if token["is_paid"] and token["is_circled"] and token["swaps_5m"] > 250:
+        rarity = "LEGENDARY"
+        score = "10/10"
+        reason = "Galen köpvåg! Både Paid status och Circled/High Hype på GMGN."
+    elif token["is_paid"] or token["volume_5m"] > 15000:
+        rarity = "RARE"
+        score = "8/10"
+        reason = "Stark volym och bekräftade socials/Paid badge på GMGN."
+    else:
+        rarity = "COMMON"
+        score = "6/10"
+        reason = "Tidigt momentum med stabilt antal swaps på 5 minuter."
+
+    return {
+        "rarity": rarity,
+        "score": score,
+        "reason": reason
+    }
 
 # ==========================================
 # 3. TELEGRAM ALERT
 # ==========================================
-def send_telegram_alert(token, ai_res):
-    rarity = ai_res.get("rarity", "COMMON").upper()
+def send_telegram_alert(token, eval_res):
+    rarity = eval_res["rarity"]
     
     if rarity == "LEGENDARY":
         header = "🟡🟡 **LEGENDARY GMGN GEM FOUND** 🟡🟡"
@@ -136,12 +124,12 @@ def send_telegram_alert(token, ai_res):
         f"💎 *Ticker:* `${token['ticker']}`\n"
         f"🏷 *Namn:* {token['symbol']}\n"
         f"⏱ *Ålder:* {token['age_minutes']} minuter gammal\n"
-        f"⭐ *AI Score:* {ai_res.get('narrative_score')}/10\n"
+        f"⭐ *Score:* {eval_res['score']}\n"
         f"{badge}\n\n"
         f"💧 *Likviditet:* ${token['liquidity']:,}\n"
         f"📈 *5m Volym:* ${token['volume_5m']:,}\n"
         f"🔄 *5m Swaps:* {token['swaps_5m']}\n\n"
-        f"🧠 *AI Analys:*\n_{ai_res.get('analysis')}_\n\n"
+        f"🧠 *Analys:*\n_{eval_res['reason']}_\n\n"
         f"📋 *Contract Address:*\n"
         f"`{token['address']}`\n\n"
         f"🔗 [Öppna på GMGN.ai]({token['gmgn_url']})"
@@ -164,7 +152,7 @@ def send_telegram_alert(token, ai_res):
 # 4. SKANNER-LOOP
 # ==========================================
 def scanner_loop():
-    print("🚀 Boten skannar GMGN Hot Searches efter mynt < 15 minuter...")
+    print("🚀 Boten skannar GMGN (100% gratis läge)...")
     while True:
         tokens = fetch_gmgn_hot_searches()
         for t in tokens:
@@ -173,18 +161,16 @@ def scanner_loop():
                 continue
             
             seen_tokens.add(addr)
-            ai_eval = analyze_coin_with_ai(t)
+            eval_res = evaluate_coin(t)
             
-            if ai_eval and ai_eval.get("is_good"):
-                send_telegram_alert(t, ai_eval)
+            if eval_res:
+                send_telegram_alert(t, eval_res)
 
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    # Starta skannern i en egen tråd
     t = threading.Thread(target=scanner_loop)
     t.daemon = True
     t.start()
     
-    # Starta webbservern så Render godkänner det som gratis Web Service
     run_web_server()
