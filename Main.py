@@ -1,30 +1,44 @@
 import os
 import time
 import json
+import threading
 import requests
+from flask import Flask
 from openai import OpenAI
+
+# ==========================================
+# FLASK WEBB SERVER (FÖR GRATIS RENDER)
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "GMGN Bot is running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # ==========================================
 # KONFIGURATION
 # ==========================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "DIN_OPENAI_API_KEY_HÄR")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = "8652036515:AAGbRQafmDHgcCRAbF2JV75beaqF9GptdgM"
 TELEGRAM_CHAT_ID = "8405852294"
 
-CHECK_INTERVAL = 10    # Skanna var 10:e sekund
-MAX_AGE_MINUTES = 15.0 # ÄNDRAT: Max 15 minuter gamla mynt
+CHECK_INTERVAL = 10
+MAX_AGE_MINUTES = 15.0
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 seen_tokens = set()
 
 # ==========================================
-# 1. HÄMTA GMGN HOT SEARCHES & TRENDING
+# 1. HÄMTA GMGN HOT SEARCHES
 # ==========================================
 def fetch_gmgn_hot_searches():
-    # GMGN Trending API för Solana (Smart Money / Swaps / Trending)
     url = "https://gmgn.ai/defi/quotation/v1/rank/sol/wallets/5m?limit=40&orderby=swaps&direction=desc"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
 
@@ -40,7 +54,6 @@ def fetch_gmgn_hot_searches():
                 created_at = t.get("creation_timestamp", now_ts)
                 age_minutes = (now_ts - created_at) / 60.0
                 
-                # Filtrera på max 15 minuter
                 if age_minutes <= MAX_AGE_MINUTES:
                     is_paid = t.get("is_paid", False) or t.get("has_socials", False)
                     is_circled = t.get("hot_level", 0) > 1 or t.get("swaps", 0) > 300
@@ -64,7 +77,7 @@ def fetch_gmgn_hot_searches():
     return []
 
 # ==========================================
-# 2. AI ANALYS & RARITETS-BEDÖMNING
+# 2. AI ANALYS
 # ==========================================
 def analyze_coin_with_ai(token):
     prompt = f"""
@@ -81,14 +94,14 @@ Utvärdera följande token (Ålder: {token['age_minutes']} min):
 Bestäm om myntet har hög potential och ge det en raritet (COMMON, RARE, LEGENDARY):
 - COMMON: Bra första tryck/swaps, nyligen startad (< 15 min).
 - RARE: Stark volym/likviditet, har Paid badge/verifierat eller mycket aktiv köpvåg.
-- LEGENDARY: Galen köpvåg, Paid/Circled, perfekt viral narrative (som gstock, meta-trend eller kändis-hype).
+- LEGENDARY: Galen köpvåg, Paid/Circled, perfekt viral narrative.
 
 Svara BARA i giltigt JSON:
 {{
   "is_good": true/false,
   "rarity": "COMMON" / "RARE" / "LEGENDARY",
   "narrative_score": 1-10,
-  "analysis": "Kort motivering på svenska varför myntet är bra/dåligt."
+  "analysis": "Kort motivering på svenska."
 }}
 """
     try:
@@ -103,7 +116,7 @@ Svara BARA i giltigt JSON:
         return None
 
 # ==========================================
-# 3. TELEGRAM NOTIS MED BILDER & RARITET
+# 3. TELEGRAM ALERT
 # ==========================================
 def send_telegram_alert(token, ai_res):
     rarity = ai_res.get("rarity", "COMMON").upper()
@@ -129,9 +142,9 @@ def send_telegram_alert(token, ai_res):
         f"📈 *5m Volym:* ${token['volume_5m']:,}\n"
         f"🔄 *5m Swaps:* {token['swaps_5m']}\n\n"
         f"🧠 *AI Analys:*\n_{ai_res.get('analysis')}_\n\n"
-        f"📋 *Contract Address (Tryck för att kopiera):*\n"
+        f"📋 *Contract Address:*\n"
         f"`{token['address']}`\n\n"
-        f"🔗 [Öppna direkt på GMGN.ai]({token['gmgn_url']})"
+        f"🔗 [Öppna på GMGN.ai]({token['gmgn_url']})"
     )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -143,20 +156,15 @@ def send_telegram_alert(token, ai_res):
     }
     
     try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code == 200:
-            print(f"✅ [{rarity}] Notis skickad för ${token['ticker']}")
-        else:
-            print(f"❌ Telegram API Fel: {res.text}")
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"❌ Telegram Error: {e}")
+        print(f"Telegram Error: {e}")
 
 # ==========================================
-# 4. SKANNINGSLOOP
+# 4. SKANNER-LOOP
 # ==========================================
-def main():
-    print("🚀 Boten skannar nu GMGN Hot Searches efter mynt < 15 minuter...")
-    
+def scanner_loop():
+    print("🚀 Boten skannar GMGN Hot Searches efter mynt < 15 minuter...")
     while True:
         tokens = fetch_gmgn_hot_searches()
         for t in tokens:
@@ -165,17 +173,18 @@ def main():
                 continue
             
             seen_tokens.add(addr)
-            print(f"🔍 Utvärderar: ${t['ticker']} ({t['symbol']}) - {t['age_minutes']}m gammal")
-
             ai_eval = analyze_coin_with_ai(t)
             
             if ai_eval and ai_eval.get("is_good"):
                 send_telegram_alert(t, ai_eval)
-            else:
-                reason = ai_eval.get("analysis") if ai_eval else "Svagt narrativ"
-                print(f"❌ PASS: {reason}")
 
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    # Starta skannern i en egen tråd
+    t = threading.Thread(target=scanner_loop)
+    t.daemon = True
+    t.start()
+    
+    # Starta webbservern så Render godkänner det som gratis Web Service
+    run_web_server()
